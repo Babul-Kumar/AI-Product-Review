@@ -220,7 +220,7 @@ def health() -> dict[str, str]:
     }
 
 
-def is_review_related(text: str) -> bool:
+def is_review_related_rule_based(text: str) -> bool | None:
     text_lower = text.lower().strip()
     if not text_lower:
         return False
@@ -234,7 +234,30 @@ def is_review_related(text: str) -> bool:
     if len(text_lower) > 15 and len(text_lower.split()) >= 3:
         return True
 
-    return False
+    return None
+
+
+# Hybrid scope detection:
+# Rule-based -> fast filtering
+# AI fallback -> handles edge cases
+def is_review_related(text: str) -> bool:
+    rule_based_result = is_review_related_rule_based(text)
+    ai_result: bool | None = None
+
+    if rule_based_result is not None:
+        logger.info("Scope check: rule=%s, ai=%s", rule_based_result, ai_result)
+        return rule_based_result
+
+    try:
+        ai_result = is_review_related_ai(text)
+        if ai_result:
+            logger.info("Scope check: rule=%s, ai=%s", rule_based_result, ai_result)
+            return True
+    except Exception as exc:
+        logger.warning("Hybrid scope detection fallback failed: %s", exc)
+
+    logger.info("Scope check fallback: allowing input (rule=%s, ai=%s)", rule_based_result, ai_result)
+    return True
 
 
 def classify_sentiment(text: str) -> tuple[str, float]:
@@ -611,6 +634,45 @@ def resolve_model_name(raw_model_name: str) -> str:
         return resolved_model_name
 
     return cleaned_model_name
+
+
+def is_review_related_ai(text: str) -> bool:
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key or api_key in PLACEHOLDER_API_KEYS:
+        return False
+
+    model_name = resolve_model_name(os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL))
+    prompt = f"""
+Classify the following text:
+
+Is this a product review or user experience related to a product?
+
+Text: {json.dumps(text)}
+
+Answer ONLY "yes" or "no"
+""".strip()
+
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0,
+                response_mime_type="text/plain",
+            ),
+        )
+        answer = (response.text or "").strip().lower()
+
+        if answer.startswith("yes"):
+            return True
+
+        if answer.startswith("no"):
+            return False
+    except Exception as exc:
+        logger.warning("AI scope detection failed, falling back to rule-based decision: %s", exc)
+
+    return False
 
 
 def normalize_analysis(ai_analysis: AIAnalysis) -> AIAnalysis:
