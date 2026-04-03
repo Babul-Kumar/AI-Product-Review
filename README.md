@@ -39,7 +39,7 @@ frontend/
 cd backend
 python -m venv .venv
 .venv\Scripts\activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
@@ -53,7 +53,7 @@ GEMINI_MODEL=gemini-2.5-flash
 Run the FastAPI server:
 
 ```powershell
-uvicorn main:app --reload
+python -m uvicorn main:app --reload
 ```
 
 The backend will be available at `http://127.0.0.1:8000`.

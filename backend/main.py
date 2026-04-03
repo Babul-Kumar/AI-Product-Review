@@ -276,24 +276,29 @@ def classify_sentiment(text: str) -> tuple[str, float]:
     return "neutral", polarity
 
 
-def calculate_sentiment(reviews: list[str]) -> dict[str, int | float]:
-    positive_count = 0
-    neutral_count = 0
-    negative_count = 0
+def calculate_sentiment(ai_analysis: AIAnalysis) -> dict[str, int | float]:
+    # CHANGED: sentiment now comes from Gemini/fallback analysis output, not TextBlob polarity.
+    def count_real_points(points: list[str]) -> int:
+        return sum(
+            1
+            for point in points
+            if normalize_point(point)
+            and not normalize_point(point).lower().startswith(GENERIC_POINT_MARKERS)
+        )
 
-    for index, review in enumerate(reviews):
-        sentiment_label, polarity = classify_sentiment(review)
-        logger.info("Review %s polarity: %.3f (%s)", index + 1, polarity, sentiment_label)
+    positive_count = count_real_points(ai_analysis.pros)
+    negative_count = count_real_points(ai_analysis.cons)
+    neutral_count = count_real_points(ai_analysis.neutral_points)
+    total_points = positive_count + negative_count + neutral_count
 
-        if sentiment_label == "positive":
-            positive_count += 1
-        elif sentiment_label == "negative":
-            negative_count += 1
-        else:
-            neutral_count += 1
+    logger.info(
+        "Sentiment derived from analysis output: %s pros, %s cons, %s neutral points.",
+        positive_count,
+        negative_count,
+        neutral_count,
+    )
 
-    total_reviews = len(reviews)
-    if total_reviews == 0:
+    if total_points == 0:
         return {
             "positive": 0.0,
             "neutral": 0.0,
@@ -306,25 +311,26 @@ def calculate_sentiment(reviews: list[str]) -> dict[str, int | float]:
             "negative_count": 0,
         }
 
+    # CHANGED: percentages are based on pros/cons/neutral_points counts and rounded to 2 decimals.
     positive_percentage, neutral_percentage, negative_percentage = calculate_percentages(
         positive_count,
         neutral_count,
         negative_count,
-        total_reviews,
+        total_points,
     )
-    score = calculate_score(positive_count, negative_count, total_reviews)
+    score = calculate_score(positive_count, negative_count, total_points)
     confidence = calculate_confidence(
         positive_count,
         neutral_count,
         negative_count,
-        total_reviews,
+        total_points,
     )
 
     return {
         "positive": positive_percentage,
         "neutral": neutral_percentage,
         "negative": negative_percentage,
-        "total": total_reviews,
+        "total": total_points,
         "score": score,
         "confidence": confidence,
         "positive_count": positive_count,
@@ -949,8 +955,19 @@ def analyze_reviews(payload: ReviewRequest) -> AnalyzeResponse:
                 raise HTTPException(status_code=400, detail="Out of scope question is asked.")
 
         logger.info("Received /analyze request with %s reviews.", len(payload.reviews))
-        sentiment = calculate_sentiment(payload.reviews)
-        ai_analysis = get_ai_analysis(payload.reviews, sentiment)
+        seed_sentiment = {
+            "positive": 0.0,
+            "neutral": 0.0,
+            "negative": 0.0,
+            "total": 0,
+            "score": 0.0,
+            "confidence": 0.0,
+            "positive_count": 0,
+            "neutral_count": 0,
+            "negative_count": 0,
+        }
+        ai_analysis = get_ai_analysis(payload.reviews, seed_sentiment)
+        sentiment = calculate_sentiment(ai_analysis)
         response_payload = AnalyzeResponse(
             summary=ai_analysis.summary,
             pros=ai_analysis.pros,
