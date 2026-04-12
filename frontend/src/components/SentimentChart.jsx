@@ -1,7 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import Chart from "chart.js/auto";
 
-// Modified: register the center text plugin once for the app lifecycle.
+// ==============================================================================
+// CENTER TEXT PLUGIN (Registered once globally)
+// ==============================================================================
+
 const centerTextPlugin = {
   id: "sentimentCenterText",
   beforeDraw(chart, args, pluginOptions) {
@@ -35,94 +38,133 @@ const centerTextPlugin = {
   },
 };
 
-if (!globalThis.__sentimentCenterTextPluginRegistered) {
-  Chart.register(centerTextPlugin);
-  globalThis.__sentimentCenterTextPluginRegistered = true;
-}
+// ✅ FIX: Register plugin once with proper guard
+const registerPlugin = () => {
+  if (!globalThis.__sentimentCenterTextPluginRegistered) {
+    Chart.register(centerTextPlugin);
+    globalThis.__sentimentCenterTextPluginRegistered = true;
+  }
+};
+registerPlugin();
+
+// ==============================================================================
+// CONSTANTS
+// ==============================================================================
+
+const FLOAT_TOLERANCE = 0.001; // ✅ FIX: For floating point comparison
+const ANIMATION_DURATION = 800;
+const TRANSITION_DURATION = 320;
+
+// ==============================================================================
+// UTILITY FUNCTIONS
+// ==============================================================================
+
+// ✅ FIX: Safe number comparison for floating point
+const areNumbersEqual = (a, b, tolerance = FLOAT_TOLERANCE) => {
+  const numA = Number(a) || 0;
+  const numB = Number(b) || 0;
+  return Math.abs(numA - numB) < tolerance;
+};
+
+// ✅ FIX: Safe array comparison
+const hasDataChanged = (oldData, newData) => {
+  if (!Array.isArray(oldData) || !Array.isArray(newData)) return true;
+  if (oldData.length !== newData.length) return true;
+  return oldData.some((value, index) => !areNumbersEqual(value, newData[index]));
+};
+
+// ==============================================================================
+// COMPONENT
+// ==============================================================================
 
 function SentimentChart({ positive, neutral, negative, score, confidence }) {
   const canvasRef = useRef(null);
   const chartRef = useRef(null);
-  const lastLoggedConfidenceRef = useRef(null);
+  const lastLoggedRef = useRef(null);
   const previousTotalRef = useRef(0);
+  const isMountedRef = useRef(true);
 
-  // Modified: sanitize incoming values and memoize chart inputs.
-  const chartValues = useMemo(
-    () =>
-      [positive, neutral, negative].map((value) =>
-        typeof value === "number" && Number.isFinite(value) ? value : 0,
-      ),
-    [negative, neutral, positive],
-  );
+  // ✅ FIX: Proper cleanup on unmount
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      if (chartRef.current) {
+        chartRef.current.destroy();
+        chartRef.current = null;
+      }
+    };
+  }, []);
+
+  // ✅ FIX: Memoize with correct dependency order
+  const chartValues = useMemo(() => {
+    return [positive, neutral, negative].map((value) =>
+      typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0
+    );
+  }, [positive, neutral, negative]);
+
   const [safePositive, safeNeutral, safeNegative] = chartValues;
+
   const total = useMemo(
     () => chartValues.reduce((sum, value) => sum + value, 0),
-    [chartValues],
+    [chartValues]
   );
-  const [isChartVisible, setIsChartVisible] = useState(total > 0);
 
-  // Modified: keep center text safe and stable across renders.
-  const centerText = useMemo(
-    () =>
-      total === 0
-        ? "No Data"
-        : typeof score === "number" && Number.isFinite(score)
-        ? `\u2B50 ${score.toFixed(1)}`
-        : "Sentiment",
-    [score, total],
-  );
+  const [isChartVisible, setIsChartVisible] = useState(false);
+
+  // ✅ FIX: Stable center text with proper emoji handling
+  const centerText = useMemo(() => {
+    if (total === 0) return "No Data";
+    if (typeof score === "number" && Number.isFinite(score)) {
+      return `${score.toFixed(1)}`;
+    }
+    return "Sentiment";
+  }, [score, total]);
+
+  // ✅ FIX: Proper ARIA label
   const ariaLabel = useMemo(
     () =>
-      `Sentiment chart showing ${safePositive.toFixed(1)}% positive, ` +
-      `${safeNeutral.toFixed(1)}% neutral, and ${safeNegative.toFixed(1)}% negative`,
-    [safeNegative, safeNeutral, safePositive],
+      `Sentiment analysis: ${safePositive.toFixed(1)}% positive, ${safeNeutral.toFixed(1)}% neutral, ${safeNegative.toFixed(1)}% negative`,
+    [safePositive, safeNeutral, safeNegative]
   );
 
-  // Modified: fade the chart in when data becomes available again.
+  // Handle visibility transitions
   useEffect(() => {
     if (total === 0) {
       setIsChartVisible(false);
       previousTotalRef.current = 0;
-      return undefined;
+      return;
     }
 
-    let frameId;
+    // Animate in when data first appears
     if (previousTotalRef.current === 0) {
       setIsChartVisible(false);
-      frameId = requestAnimationFrame(() => {
-        setIsChartVisible(true);
+      const frameId = requestAnimationFrame(() => {
+        if (isMountedRef.current) {
+          setIsChartVisible(true);
+        }
       });
-    } else {
-      setIsChartVisible(true);
+      previousTotalRef.current = total;
+      return () => cancelAnimationFrame(frameId);
     }
 
+    setIsChartVisible(true);
     previousTotalRef.current = total;
-
-    return () => {
-      if (frameId) {
-        cancelAnimationFrame(frameId);
-      }
-    };
   }, [total]);
 
+  // Chart creation and updates
   useEffect(() => {
-    if (!canvasRef.current) {
-      return undefined;
-    }
-
-    if (total === 0 && chartRef.current) {
-      chartRef.current.canvas.style.cursor = "default";
-      chartRef.current.destroy();
-      chartRef.current = null;
-      return undefined;
-    }
-
+    // Destroy chart when no data
     if (total === 0) {
-      canvasRef.current.style.cursor = "default";
-      return undefined;
+      if (chartRef.current) {
+        chartRef.current.destroy();
+        chartRef.current = null;
+      }
+      return;
     }
 
-    if (!chartRef.current) {
+    // Create new chart if needed
+    if (!chartRef.current && canvasRef.current) {
       chartRef.current = new Chart(canvasRef.current, {
         type: "pie",
         data: {
@@ -132,21 +174,19 @@ function SentimentChart({ positive, neutral, negative, score, confidence }) {
               label: "Sentiment",
               data: [safePositive, safeNeutral, safeNegative],
               backgroundColor: [
-                "rgba(34,197,94,0.85)",
-                "rgba(234,179,8,0.85)",
-                "rgba(244,63,94,0.85)",
+                "rgba(34, 197, 94, 0.85)",
+                "rgba(234, 179, 8, 0.85)",
+                "rgba(244, 63, 94, 0.85)",
               ],
-              // Modified: brighter hover colors for a clearer highlight effect.
               hoverBackgroundColor: [
-                "rgba(74,222,128,0.98)",
-                "rgba(250,204,21,0.98)",
-                "rgba(251,113,133,0.98)",
+                "rgba(74, 222, 128, 0.98)",
+                "rgba(250, 204, 21, 0.98)",
+                "rgba(251, 113, 133, 0.98)",
               ],
               borderColor: ["#0f172a", "#0f172a", "#0f172a"],
               borderWidth: 2,
-              // Modified: subtle visual polish for hover and segment separation.
               spacing: 2,
-              hoverBorderColor: "rgba(248,250,252,0.9)",
+              hoverBorderColor: "rgba(248, 250, 252, 0.9)",
               hoverBorderWidth: 3,
               hoverOffset: 14,
             },
@@ -156,17 +196,15 @@ function SentimentChart({ positive, neutral, negative, score, confidence }) {
           responsive: true,
           maintainAspectRatio: false,
           cutout: "58%",
-          // Modified: hover cursor feedback for interactive slices.
           onHover(event, elements, chart) {
             const canvas = chart?.canvas || event?.native?.target;
-
             if (canvas) {
               canvas.style.cursor = elements.length > 0 ? "pointer" : "default";
             }
           },
           animation: {
             animateRotate: true,
-            duration: 1000,
+            duration: ANIMATION_DURATION,
           },
           plugins: {
             centerText: {
@@ -186,7 +224,7 @@ function SentimentChart({ positive, neutral, negative, score, confidence }) {
                   const dataset = chart.data.datasets[0];
 
                   return labels.map((label, index) => ({
-                    text: `${label}: ${Number(dataset.data[index] || 0).toFixed(1)}%`,
+                    text: `${label}: ${(dataset.data[index] || 0).toFixed(1)}%`,
                     fillStyle: dataset.backgroundColor[index],
                     strokeStyle: dataset.borderColor[index],
                     lineWidth: dataset.borderWidth,
@@ -198,91 +236,90 @@ function SentimentChart({ positive, neutral, negative, score, confidence }) {
             },
             tooltip: {
               callbacks: {
-                // Modified: cleaner spacing and safer numeric formatting.
                 label(context) {
-                  return ` ${context.label}: ${Number(context.parsed ?? 0).toFixed(1)}% (out of total sentiment)`;
+                  const value = context.parsed ?? 0;
+                  return ` ${context.label}: ${value.toFixed(1)}%`;
                 },
               },
             },
           },
         },
       });
-      return undefined;
+      return;
     }
 
-    // Modified: update only the changing pieces to avoid unnecessary chart work.
-    const nextData = [safePositive, safeNeutral, safeNegative];
-    const dataset = chartRef.current.data.datasets[0];
-    const hasDataChanged = dataset.data.some((value, index) => Number(value) !== nextData[index]);
-    const currentCenterText = chartRef.current.options.plugins?.centerText?.text;
-    const hasCenterTextChanged = currentCenterText !== centerText;
+    // Update existing chart
+    if (chartRef.current) {
+      const nextData = [safePositive, safeNeutral, safeNegative];
+      const dataset = chartRef.current.data.datasets[0];
 
-    if (hasDataChanged) {
-      dataset.data = nextData;
+      // ✅ FIX: Use safe comparison
+      const dataNeedsUpdate = hasDataChanged(dataset.data, nextData);
+      const centerTextChanged = chartRef.current.options.plugins?.centerText?.text !== centerText;
+
+      if (dataNeedsUpdate) {
+        dataset.data = nextData;
+      }
+
+      if (centerTextChanged && chartRef.current.options.plugins?.centerText) {
+        chartRef.current.options.plugins.centerText.text = centerText;
+      }
+
+      if (dataNeedsUpdate || centerTextChanged) {
+        chartRef.current.update();
+      }
     }
-
-    if (hasCenterTextChanged && chartRef.current.options.plugins?.centerText) {
-      chartRef.current.options.plugins.centerText.text = centerText;
-    }
-
-    if (hasDataChanged || hasCenterTextChanged) {
-      chartRef.current.update();
-    }
-
-    return undefined;
   }, [centerText, safeNegative, safeNeutral, safePositive, total]);
 
-  // Modified: debug logging stays dev-only and avoids repeated identical logs.
+  // ✅ FIX: Debounced resize handler
   useEffect(() => {
-    if (
-      import.meta.env.DEV &&
-      typeof confidence === "number" &&
-      Number.isFinite(confidence) &&
-      lastLoggedConfidenceRef.current !== confidence
-    ) {
-      console.debug("Sentiment chart confidence:", confidence);
-      lastLoggedConfidenceRef.current = confidence;
-    }
-  }, [confidence]);
+    let resizeTimeout;
 
-  useEffect(() => {
-    return () => {
-      if (chartRef.current) {
-        chartRef.current.canvas.style.cursor = "default";
-        chartRef.current.destroy();
-        chartRef.current = null;
-      }
-    };
-  }, []);
-
-  // Modified: extra resize safety for responsive canvas rendering.
-  useEffect(() => {
     const handleResize = () => {
-      if (chartRef.current) {
-        chartRef.current.resize();
-      }
+      clearTimeout(resizeTimeout);
+      resizeTimeout = setTimeout(() => {
+        if (chartRef.current && isMountedRef.current) {
+          chartRef.current.resize();
+        }
+      }, 100);
     };
 
     window.addEventListener("resize", handleResize);
     return () => {
       window.removeEventListener("resize", handleResize);
+      clearTimeout(resizeTimeout);
     };
   }, []);
 
+  // Debug logging (dev only)
+  useEffect(() => {
+    if (
+      import.meta.env.DEV &&
+      typeof confidence === "number" &&
+      Number.isFinite(confidence) &&
+      lastLoggedRef.current !== confidence
+    ) {
+      console.debug("[Chart] Confidence:", confidence.toFixed(2));
+      lastLoggedRef.current = confidence;
+    }
+  }, [confidence]);
+
+  // Empty state
   if (total === 0) {
     return (
       <div className="flex h-72 items-center justify-center rounded-3xl border border-white/10 bg-slate-900/40 px-6 text-center text-sm text-slate-300">
-        No sentiment data is available yet.
+        No sentiment data available yet.
       </div>
     );
   }
 
+  // Chart container
   return (
     <div
       className="h-72 rounded-3xl border border-white/10 bg-slate-900/40 p-4 shadow-[0_18px_60px_rgba(15,23,42,0.25)]"
       style={{
         opacity: isChartVisible ? 1 : 0,
-        transition: "opacity 320ms ease",
+        transition: `opacity ${TRANSITION_DURATION}ms ease`,
       }}
     >
       <canvas
@@ -290,7 +327,7 @@ function SentimentChart({ positive, neutral, negative, score, confidence }) {
         aria-label={ariaLabel}
         role="img"
         tabIndex={0}
-        className="rounded-2xl focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-emerald-400"
+        className="rounded-2xl focus:outline-none focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-emerald-400"
       />
     </div>
   );
