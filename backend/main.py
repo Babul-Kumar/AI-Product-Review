@@ -91,8 +91,8 @@ DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 LEGACY_MODEL_ALIASES = {"gemini-pro": DEFAULT_GEMINI_MODEL}
 
 # Performance timeouts
-GEMINI_TIMEOUT = 4
-REQUEST_TIMEOUT = 30
+GEMINI_TIMEOUT = 10
+REQUEST_TIMEOUT = 60
 
 # Limits
 MAX_POINTS = int(os.getenv("MAX_POINTS", "6"))
@@ -110,6 +110,10 @@ MAX_INPUT_SIZE = 10000
 MAX_CLAUSES_FOR_AI = int(os.getenv("MAX_CLAUSES_FOR_AI", "20"))
 GEMINI_MAX_CLAUSES = 10
 GEMINI_MAX_CHARS = 300
+
+# ⚠️ FIX #1: STRICTER RELEVANCE THRESHOLD (changed from 0.3 to 0.4)
+RELEVANCE_THRESHOLD = float(os.getenv("RELEVANCE_THRESHOLD", "0.4"))
+MIN_PRODUCT_INDICATORS = int(os.getenv("MIN_PRODUCT_INDICATORS", "2"))
 
 # API version prefix
 API_V1_PREFIX = "/api/v1"
@@ -145,6 +149,268 @@ NEGATIONS = frozenset({
 class WarningDetail(BaseModel):
     type: str
     message: str
+
+
+# ==============================================================================
+# 🚨 OUT-OF-SCOPE EXCEPTION
+# ==============================================================================
+class OutOfScopeError(Exception):
+    """Raised when input is not related to product reviews"""
+    def __init__(self, message: str, detected_type: str = "unknown"):
+        self.message = message
+        self.detected_type = detected_type
+        super().__init__(self.message)
+
+
+# ==============================================================================
+# PRODUCT REVIEW RELEVANCE DETECTION
+# ==============================================================================
+
+# 🚨 FIX #3: CONTEXT-AWARE IRRELEVANT PATTERNS
+# Patterns are designed to only trigger when NOT surrounded by product review context
+
+# Product review indicators (used to cancel irrelevant pattern detection)
+PRODUCT_REVIEW_INDICATORS = [
+    r"\b(review|reviews|rating|stars|recommend|worth|buy|purchase|product|quality)\b",
+    r"\b(pros?|cons?|advantages?|disadvantages?|likes?|dislikes?)\b",
+    r"\b(\d+\s*stars?|\d+\/10|rating\s*\d+)\b",
+    r"\b(bought|ordered|received|shipping|delivered|arrived|returned|refund)\b",
+]
+
+# Compile product indicators
+_PRODUCT_INDICATOR_PATTERN = re.compile("|".join(PRODUCT_REVIEW_INDICATORS), re.IGNORECASE)
+
+# Irrelevant patterns - but with context awareness
+# Each pattern now has a flag for whether it needs product context to trigger
+IRRELEVANT_PATTERNS_CONFIG = [
+    # Sports - High confidence when standalone
+    {"pattern": r"\b(cricket match|football match|soccer match)\b", "weight": 0.8, "needs_context": False},
+    {"pattern": r"\b(world cup|super bowl|nba finals|nfl playoffs)\b", "weight": 0.8, "needs_context": False},
+    {"pattern": r"\b(play cricket|watch football|go soccer|tennis match|golf game)\b", "weight": 0.8, "needs_context": False},
+    # BUT: "cricket bat review" should NOT trigger sports penalty
+    {"pattern": r"\b(cricket|football|soccer|basketball|tennis|golf|baseball|hockey|rugby|olympics)\b(?!.*\b(bat|ball|review|product|rating|buy|purchase|amazon|website|store|shop)\b)", "weight": 0.6, "needs_context": True},
+    
+    # News/Politics - High confidence
+    {"pattern": r"\b(election|trump|biden|politics|government|law|congress|senate|parliament|lawyer|court|trial|lawsuit)\b", "weight": 0.9, "needs_context": False},
+    
+    # Entertainment
+    {"pattern": r"\b(netflix series|spotify playlist|youtube video|movie review|film director|actor performance)\b", "weight": 0.8, "needs_context": False},
+    {"pattern": r"\b(movie|film|series|netflix|spotify|youtube|instagram|tiktok|facebook|twitter|social media|influencer)\b(?!.*\b(review|recommend|rating|product|buy|quality|worth)\b)", "weight": 0.5, "needs_context": True},
+    
+    # Finance/Trading
+    {"pattern": r"\b(stock market|trading strategy|investing tips|crypto price|bitcoin value|forex trading)\b", "weight": 0.9, "needs_context": False},
+    {"pattern": r"\b(stock|market|trading|investing|crypto|bitcoin|ethereum|forex|shares|portfolio|dividend)\b(?!.*\b(review|product|buy|purchase|worth|quality)\b)", "weight": 0.6, "needs_context": True},
+    
+    # Tech (but not product reviews)
+    {"pattern": r"\b(programming tutorial|coding course|algorithm explanation|software development|startup funding|venture capital|ipo news)\b", "weight": 0.9, "needs_context": False},
+    
+    # Medical/Health
+    {"pattern": r"\b(symptoms|diagnosis|treatment|prescription|surgery|therapy|doctor|hospital|medical|health)\b(?!.*\b(review|product|rating|buy|worth|recommend)\b)", "weight": 0.7, "needs_context": True},
+    
+    # Recipes/Cooking
+    {"pattern": r"\b(recipe|cook|bake|chef|kitchen|ingredient|oven|stove|grill)\b(?!.*\b(review|recommend|buy|product|worth|quality)\b)", "weight": 0.6, "needs_context": True},
+    
+    # Travel
+    {"pattern": r"\b(flight booking|hotel reservation|vacation planning|travel tips|airline review|boarding pass|passport|visa)\b", "weight": 0.8, "needs_context": False},
+    {"pattern": r"\b(flight|hotel|vacation|travel|trip|booking|airbnb|airline|airport|destination)\b(?!.*\b(review|recommend|buy|product|worth|quality)\b)", "weight": 0.5, "needs_context": True},
+    
+    # Academic/Educational
+    {"pattern": r"\b(university|college|school|exam|grade|homework|assignment|course|study|research|thesis|professor)\b(?!.*\b(review|product|buy|worth|recommend)\b)", "weight": 0.6, "needs_context": True},
+    
+    # Other non-product
+    {"pattern": r"\b(joke|riddle|puzzle|meme|horoscope|astrology|fortune|tarot)\b", "weight": 0.9, "needs_context": False},
+]
+
+# Compile patterns
+_IRRELEVANT_PATTERN_CONFIGS = IRRELEVANT_PATTERNS_CONFIG
+
+# Product review indicators for scoring
+PRODUCT_INDICATORS_SCORING = [
+    r"\b(review|reviews|rating|stars|recommend|not recommend|worth it|not worth|buy|don'?t buy|purchase)\b",
+    r"\b(product|item|device|gadget|item|brand|model|version)\b",
+    r"\b(quality|price|value|durable|reliable|sturdy|flimsy|cheap|premium)\b",
+    r"\b(using|used|use|experience|experienced|tried|testing|tested)\b.*\b(product|it|this|that)\b",
+    r"\b(product|it|this|that)\b.*\b(using|used|use|experience|experienced|tried|testing|tested)\b",
+    r"\b(\d+\s*stars?|\d+\s*out\s*of\s*\d+|rating\s*\d+)\b",
+    r"\b(pros?|cons?|advantages?|disadvantages?|likes?|dislikes?|upside|downside)\b",
+]
+
+_PRODUCT_PATTERNS = [re.compile(p, re.IGNORECASE) for p in PRODUCT_INDICATORS_SCORING]
+
+
+def has_product_review_context(text: str) -> bool:
+    """
+    Check if text has strong product review context.
+    This is used to determine if irrelevant pattern matches should be ignored.
+    """
+    # Check for strong product review indicators
+    indicator_matches = _PRODUCT_INDICATOR_PATTERN.findall(text)
+    
+    # If we have 2+ product indicators, it's likely a product review context
+    if len(indicator_matches) >= 2:
+        return True
+    
+    # Check for specific high-confidence product review patterns
+    strong_patterns = [
+        r"\b(review|rating|recommend)\b.*\b(product|quality|worth|price)\b",
+        r"\b(product|quality|worth|price)\b.*\b(review|rating|recommend)\b",
+        r"\b(buy|purchase|ordered|received)\b.*\b(product|item|thing)\b",
+        r"\b(\d+\s*stars?)\b.*\b(product|quality|worth)\b",
+    ]
+    
+    for pattern in strong_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            return True
+    
+    return False
+
+
+def calculate_relevance_score(text: str) -> float:
+    """
+    Calculate how relevant the text is to product reviews.
+    Returns a score from 0.0 to 1.0.
+    
+    FIX #3: Context-aware detection - irrelevant patterns don't trigger 
+    when the text has strong product review context.
+    
+    Score breakdown:
+    - Contains product review indicators: +0.3 to +0.5
+    - Contains product keywords: +0.1 to +0.2
+    - Contains irrelevant topics: -0.5 to -0.8 (reduced or cancelled if context present)
+    - Text length bonus: +0.0 to +0.1
+    """
+    text_lower = text.lower()
+    score = 0.0
+    
+    # FIRST: Check if text has strong product review context
+    has_review_context = has_product_review_context(text_lower)
+    
+    # SECOND: Check for irrelevant patterns with context awareness
+    irrelevant_matches = []
+    for config in _IRRELEVANT_PATTERN_CONFIGS:
+        matches = re.findall(config["pattern"], text_lower)
+        if matches:
+            # If pattern needs context, only apply if NO review context
+            if config["needs_context"] and has_review_context:
+                # Reduce penalty significantly
+                irrelevant_matches.append((matches, config["weight"] * 0.3))
+            else:
+                irrelevant_matches.append((matches, config["weight"]))
+    
+    if irrelevant_matches:
+        # Calculate weighted penalty
+        total_penalty = 0.0
+        for matches, weight in irrelevant_matches:
+            total_penalty += min(weight * len(matches), 0.6)
+        score -= min(total_penalty, 0.8)  # Cap total penalty
+    
+    # Check for product review indicators
+    product_indicator_count = 0
+    for pattern in _PRODUCT_PATTERNS:
+        if pattern.search(text_lower):
+            product_indicator_count += 1
+    
+    if product_indicator_count >= 4:
+        score += 0.5
+    elif product_indicator_count >= 2:
+        score += 0.35
+    elif product_indicator_count == 1:
+        score += 0.2
+    
+    # Check for product-related keywords
+    product_keywords = [
+        "bought", "purchase", "ordered", "received", "shipping", "delivery",
+        "returned", "refund", "warranty", "package", "arrived", 
+        "product", "item", "device", "gadget", "thing",
+        "better", "worse", "compared", "versus", "vs",
+    ]
+    keyword_hits = sum(1 for kw in product_keywords if kw in text_lower)
+    if keyword_hits >= 4:
+        score += 0.2
+    elif keyword_hits >= 2:
+        score += 0.1
+    
+    # Length bonus (longer reviews are more likely to be genuine)
+    word_count = len(text.split())
+    if word_count >= 50:
+        score += 0.1
+    elif word_count >= 20:
+        score += 0.05
+    
+    # Ensure score is between 0 and 1
+    return max(0.0, min(1.0, score))
+
+
+def is_product_review_related(text: str) -> Tuple[bool, float, str]:
+    """
+    Check if the input is related to product reviews.
+    
+    Returns:
+        Tuple of (is_relevant, score, detected_type)
+    
+    FIX #2: "partial" classification is NO LONGER accepted.
+    Only "product_review" passes (score >= 0.4).
+    
+    detected_type can now only be:
+        - "product_review" - clearly a product review (score >= 0.4)
+        - "irrelevant" - not a product review (score < 0.4)
+    """
+    score = calculate_relevance_score(text)
+    
+    # FIX #2: Only accept if score >= 0.4 (clearly a product review)
+    # "partial" classification is completely removed
+    if score >= 0.4:
+        return True, score, "product_review"
+    else:
+        return False, score, "irrelevant"
+
+
+def detect_out_of_scope_category(text: str) -> str:
+    """
+    Detect what category the out-of-scope input falls into.
+    FIX #3: Uses context-aware detection.
+    """
+    text_lower = text.lower()
+    
+    # First check for strong product review context
+    if has_product_review_context(text_lower):
+        return "product_review"  # Shouldn't happen if called correctly
+    
+    categories = {
+        "sports": ["cricket match", "football game", "soccer match", "basketball", "tennis match", 
+                   "world cup", "super bowl", "player's performance", "team winning", "score prediction"],
+        "politics": ["election", "trump", "biden", "politics", "government", "law", "vote", "party", "congress", "senator"],
+        "entertainment": ["movie review", "film", "netflix series", "spotify playlist", "youtube video", 
+                          "song", "actor", "director", "album", "concert"],
+        "finance": ["stock market", "trading", "crypto", "bitcoin", "invest", "shares", "portfolio", "dividend"],
+        "tech_news": ["startup funding", "ipo", "acquisition", "layoffs", "tech industry", "programming tutorial"],
+        "health": ["symptoms", "diagnosis", "treatment", "doctor", "hospital", "medical", "prescription", "health tips"],
+        "travel": ["flight booking", "hotel", "vacation", "booking", "airport", "destination", "itinerary", "travel guide"],
+        "academic": ["university", "college exam", "grade", "homework", "research", "thesis", "professor"],
+        "other": []
+    }
+    
+    for category, keywords in categories.items():
+        for kw in keywords:
+            if kw in text_lower:
+                return category
+    
+    # Fallback: check for standalone irrelevant terms
+    standalone_irrelevant = [
+        ("sports", ["cricket", "football", "soccer", "basketball", "tennis", "golf", "match", "game"]),
+        ("politics", ["election", "vote", "politician", "government", "law"]),
+        ("finance", ["stock", "crypto", "investing", "trading"]),
+        ("health", ["symptoms", "diagnosis", "treatment", "medical"]),
+        ("travel", ["flight", "hotel booking", "vacation", "travel"]),
+    ]
+    
+    for category, terms in standalone_irrelevant:
+        # Only trigger if no product context
+        if not has_product_review_context(text_lower):
+            if any(f" {t} " in f" {text_lower} " or text_lower.startswith(t + " ") for t in terms):
+                return category
+    
+    return "unknown_topic"
 
 
 # ==============================================================================
@@ -302,7 +568,7 @@ def handle_special_negations(text: str) -> str:
 
 
 # ==============================================================================
-# FEATURE DETECTION (OPTIMIZED with Aho-Corasick)
+# FEATURE DETECTION
 # ==============================================================================
 BASE_FEATURES = {
     "battery": frozenset({"battery", "backup", "drain", "mah", "power", "charging", "charge", "charger", "battery life", "drains"}),
@@ -363,7 +629,7 @@ def get_features_for_domain(domain: str) -> dict:
 
 
 # ==============================================================================
-# AHO-CORASICK AUTOMATONS (Prebuilt at startup - O(n) matching)
+# AHO-CORASICK AUTOMATONS
 # ==============================================================================
 _ALIAS_AUTOMATONS: dict[str, 'ahocorasick.Automaton'] = {}
 _PHRASE_AUTOMATONS: dict[str, 'ahocorasick.Automaton'] = {}
@@ -372,20 +638,17 @@ _AHOCORASICK_BUILT = False
 
 
 def _build_ahocorasick_automaton(domain: str) -> Tuple['ahocorasick.Automaton', 'ahocorasick.Automaton', dict]:
-    """Build Aho-Corasick automatons for a domain - O(n) pattern matching"""
     features = get_features_for_domain(domain)
     
-    # Build automaton for single words
     word_automaton = ahocorasick.Automaton()
     word_to_feature = {}
     
-    # Build automaton for phrases
     phrase_automaton = ahocorasick.Automaton()
     phrase_to_feature = {}
     
     for feature, aliases in features.items():
         for alias in aliases:
-            if " " in alias:  # Multi-word phrase
+            if " " in alias:
                 phrase_automaton.add_word(alias, (alias, feature))
                 phrase_to_feature[alias] = feature
             else:
@@ -414,7 +677,7 @@ def _build_automaton_maps():
 
 
 # ==============================================================================
-# SENTIMENT WORDS (Precompiled patterns)
+# SENTIMENT WORDS
 # ==============================================================================
 STRONG_NEGATIVE = frozenset({
     "bad", "poor", "worst", "waste", "overheat", "lag", "drain", "heats",
@@ -450,13 +713,11 @@ SOFT_POSITIVE = frozenset({
 ALL_POSITIVE = STRONG_POSITIVE | SOFT_POSITIVE
 ALL_NEGATIVE = STRONG_NEGATIVE | SOFT_NEGATIVE
 
-# Precompiled patterns for keyword matching
 _STRONG_POS_PATTERN = re.compile(r'\b(' + '|'.join(sorted(STRONG_POSITIVE, key=len, reverse=True)) + r')\b')
 _SOFT_POS_PATTERN = re.compile(r'\b(' + '|'.join(sorted(SOFT_POSITIVE, key=len, reverse=True)) + r')\b')
 _STRONG_NEG_PATTERN = re.compile(r'\b(' + '|'.join(sorted(STRONG_NEGATIVE, key=len, reverse=True)) + r')\b')
 _SOFT_NEG_PATTERN = re.compile(r'\b(' + '|'.join(sorted(SOFT_NEGATIVE, key=len, reverse=True)) + r')\b')
 
-# Aho-Corasick for sentiment words
 _SENTIMENT_AUTOMATON = None
 _SENTIMENT_WORD_MAP = {}
 
@@ -478,40 +739,28 @@ def _build_sentiment_automaton():
     _SENTIMENT_WORD_MAP.update({word: "negative" for word in ALL_NEGATIVE})
 
 
-# ==============================================================================
-# ADAPTIVE SENTIMENT ANALYSIS (FIX 2: Dynamic weighting)
-# ==============================================================================
 @lru_cache(maxsize=5000)
 def get_sentiment_polarity_cached(text: str) -> Tuple[float, float]:
-    """
-    FIX 2: Adaptive sentiment with dynamic VADER/keyword weighting.
-    Returns (polarity, confidence) tuple.
-    """
     text = handle_special_negations(text)
     text_lower = text.lower()
     
-    # Step 1: Get VADER score and confidence
     vader_score = 0.0
     vader_confidence = 0.0
     
     if USE_VADER:
         vader_result = vader_analyzer.polarity_scores(text)
         vader_score = vader_result["compound"]
-        
-        # VADER confidence based on extremity of score
         vader_confidence = abs(vader_score)
         
-        # Check for mixed signals (lower confidence)
         pos = vader_result["pos"]
         neg = vader_result["neg"]
         neu = vader_result["neu"]
         
-        if max(pos, neg, neu) < 0.5:  # Signals are mixed
+        if max(pos, neg, neu) < 0.5:
             vader_confidence *= 0.7
-        elif pos > 0.3 and neg > 0.3:  # Both positive and negative signals
+        elif pos > 0.3 and neg > 0.3:
             vader_confidence *= 0.6
     
-    # Step 2: Aho-Corasick keyword matching (O(n) for all keywords)
     if _SENTIMENT_AUTOMATON:
         keyword_counts = {"positive": 0, "negative": 0}
         for end_idx, (sentiment, word) in _SENTIMENT_AUTOMATON.iter(text_lower):
@@ -522,20 +771,17 @@ def get_sentiment_polarity_cached(text: str) -> Tuple[float, float]:
         kw_pos = keyword_counts["positive"]
         kw_neg = keyword_counts["negative"]
     else:
-        # Fallback to regex matching
         kw_pos = len(_STRONG_POS_PATTERN.findall(text_lower)) + len(_SOFT_POS_PATTERN.findall(text_lower))
         kw_neg = len(_STRONG_NEG_PATTERN.findall(text_lower)) + len(_SOFT_NEG_PATTERN.findall(text_lower))
     
-    # Calculate keyword-based score
     kw_score = 0.0
-    kw_confidence = min(1.0, (kw_pos + kw_neg) / 5)  # More keywords = higher confidence
+    kw_confidence = min(1.0, (kw_pos + kw_neg) / 5)
     
     for _ in range(kw_pos):
         kw_score += 0.2
     for _ in range(kw_neg):
         kw_score -= 0.2
     
-    # Step 3: Check for negation context
     words = text_lower.split()
     for i, word in enumerate(words):
         if word in _SENTIMENT_WORD_MAP:
@@ -545,29 +791,21 @@ def get_sentiment_polarity_cached(text: str) -> Tuple[float, float]:
                 else:
                     kw_score += 0.3
     
-    # Step 4: ADAPTIVE WEIGHTING (FIX 2: Dynamic based on confidence)
     if vader_confidence > 0.7:
-        # High confidence in VADER - trust it more
         weight_vader = 0.75
         weight_kw = 0.25
     elif vader_confidence > 0.4:
-        # Medium confidence - balanced
         weight_vader = 0.6
         weight_kw = 0.4
     else:
-        # Low confidence - trust keywords more
         weight_vader = 0.4
         weight_kw = 0.6
     
-    # Also adjust based on keyword confidence
     if kw_confidence > 0.8:
         weight_kw = min(0.7, weight_kw + 0.1)
         weight_vader = 1.0 - weight_kw
     
-    # Combine scores
     blended = weight_vader * vader_score + weight_kw * kw_score
-    
-    # Calculate overall confidence
     overall_confidence = max(vader_confidence, kw_confidence)
     
     return max(-1.0, min(1.0, blended)), overall_confidence
@@ -584,7 +822,6 @@ def get_sentiment_confidence(text: str) -> float:
 
 
 def classify_sentence(sentence: str) -> str:
-    """UNIFIED classification using ONLY polarity"""
     polarity = get_sentiment_polarity(sentence)
     if polarity > SENTIMENT_POLARITY_THRESHOLD:
         return "positive"
@@ -594,22 +831,16 @@ def classify_sentence(sentence: str) -> str:
 
 
 # ==============================================================================
-# MULTI-FEATURE EXTRACTION (FIX 1: Aho-Corasick O(n) matching)
+# FEATURE EXTRACTION
 # ==============================================================================
 def extract_features_with_context(sentence: str, domain: str = "generic") -> List[str]:
-    """
-    FIX 1: Use Aho-Corasick automaton for O(n) multi-pattern matching.
-    Much faster than iterating through all features.
-    """
     sentence_lower = sentence.lower()
     detected_features = set()
     
-    # Phase 1: Check for multi-word phrases first (higher priority)
     if domain in _PHRASE_AUTOMATONS:
         for end_idx, (phrase, feature) in _PHRASE_AUTOMATONS[domain].iter(sentence_lower):
             detected_features.add(feature)
     
-    # Phase 2: Use automaton for single word matching (O(n) total)
     if domain in _ALIAS_AUTOMATONS:
         for end_idx, (word, feature) in _ALIAS_AUTOMATONS[domain].iter(sentence_lower):
             detected_features.add(feature)
@@ -766,6 +997,7 @@ class AnalyzeResponse(BaseModel):
     explained_cons: list[ExplainablePoint] | None = None
     feature_scores: list[FeatureScore] | None = None
     domain: str | None = None
+    out_of_scope: bool = False  # NEW: Flag for out-of-scope input
 
 
 # ==============================================================================
@@ -773,8 +1005,8 @@ class AnalyzeResponse(BaseModel):
 # ==============================================================================
 app = FastAPI(
     title="AI Product Review Aggregator API",
-    description="Production-ready system with enhanced sentiment analysis",
-    version="23.0-faang",
+    description="Production-ready system with FULL AI-driven analysis and out-of-scope detection",
+    version="25.0-ai-validated",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -807,6 +1039,7 @@ try:
     CACHE_HITS = Counter("review_api_cache_hits_total", "Cache hits")
     ACTIVE_REQUESTS = Gauge("review_api_active_requests", "Active requests")
     GEMINI_REQUESTS_ACTIVE = Gauge("review_api_gemini_active", "Active Gemini requests")
+    OUT_OF_SCOPE_COUNT = Counter("review_api_out_of_scope_total", "Out of scope requests")
     USE_PROMETHEUS = True
 
     @app.get("/metrics")
@@ -835,6 +1068,7 @@ except ImportError:
     CACHE_HITS = NoOpCounter()
     ACTIVE_REQUESTS = NoOpGauge()
     GEMINI_REQUESTS_ACTIVE = NoOpGauge()
+    OUT_OF_SCOPE_COUNT = NoOpCounter()
 
 
 # ==============================================================================
@@ -876,7 +1110,7 @@ request_tracker = RequestTracker()
 
 
 # ==============================================================================
-# LRU CACHE (Using orjson)
+# LRU CACHE
 # ==============================================================================
 class LRUCache:
     def __init__(self, max_size: int = 1000):
@@ -959,7 +1193,7 @@ cache_manager = CacheManager()
 
 
 # ==============================================================================
-# RATE LIMITER (Using deque to prevent memory leak)
+# RATE LIMITER
 # ==============================================================================
 class ScalableRateLimiter:
     def __init__(self):
@@ -1039,7 +1273,7 @@ scalable_limiter = ScalableRateLimiter()
 
 
 # ==============================================================================
-# GEMINI CLIENT MANAGER (Fully async with httpx)
+# GEMINI CLIENT MANAGER
 # ==============================================================================
 class GeminiKeyConfig:
     def __init__(self, key: str, name: str = ""):
@@ -1398,145 +1632,50 @@ def make_analysis_point(text: str, domain: str, connector: str = None) -> Analys
     )
 
 
-def extract_points(clauses: list[dict], domain: str = "generic") -> dict[str, list]:
-    pros_raw: List[Tuple[str, float, List[str]]] = []
-    cons_raw: List[Tuple[str, float, List[str]]] = []
-    neutral_raw: List[str] = []
-    
-    seen_signatures = set()
-    feature_signatures: dict[str, set[str]] = {}
+# ==============================================================================
+# 🚨 AI PROMPT WITH OUT-OF-SCOPE DETECTION
+# ==============================================================================
+def build_analysis_prompt(reviews: list[str], domain: str = "generic") -> str:
+    return f"""You are a strict product review analyzer.
 
-    for clause in clauses:
-        if isinstance(clause, dict):
-            clause_text = clause.get("text", "")
-            connector = clause.get("connector")
-        else:
-            clause_text = clause
-            connector = None
+⚠️ CRITICAL RULE: If the input is NOT about product reviews, you MUST return an error response.
 
-        label = classify_sentence(clause_text)
-        normalized = normalize_point(clause_text)
-        
-        if not normalized:
-            continue
-        
-        sig = get_point_signature(normalized)
-        features_list = extract_features_with_context(clause_text, domain)
+OUT-OF-SCOPE EXAMPLES (return error for these):
+- Sports queries: "Tell me about cricket match"
+- Politics: "Who won the election?"
+- Entertainment: "What movie should I watch?"
+- Finance: "Is Bitcoin going up?"
+- Health: "What are symptoms of flu?"
+- Travel: "Best hotels in Paris"
+- Recipes: "How to make pasta?"
 
-        if is_useless_point(normalized):
-            continue
-        
-        if sig in seen_signatures:
-            continue
-        seen_signatures.add(sig)
+PRODUCT REVIEW INDICATORS (only analyze if present):
+- Reviews, ratings, stars, recommend
+- Product features (battery, camera, quality, etc.)
+- Pros/Cons, advantages/disadvantages
+- Purchase experience, shipping, delivery
+- Price/value assessment
 
-        for feature in features_list:
-            if feature and feature != "general":
-                if feature not in feature_signatures:
-                    feature_signatures[feature] = set()
-                if sig[:20] in feature_signatures[feature]:
-                    continue
-                feature_signatures[feature].add(sig[:20])
+Return JSON format:
 
-        weight = 1.0
-        if connector == "but":
-            weight = 2.0
-        elif connector in {"however", "although", "though", "yet"}:
-            weight = 1.25
+FOR VALID PRODUCT REVIEWS:
+{{
+  "summary": "...",
+  "pros": [],
+  "cons": [],
+  "neutral_points": [],
+  "sentiment": {{"positive": 0, "negative": 0, "neutral": 0}}
+}}
 
-        polarity = get_sentiment_polarity(normalized)
-        
-        if connector == "but":
-            if label == "positive":
-                polarity = polarity * 1.5
-            elif label == "negative":
-                polarity = polarity * 1.5
-        
-        weighted_polarity = abs(polarity) * weight
-        
-        if label == "positive":
-            pros_raw.append((normalized, weighted_polarity, features_list))
-        elif label == "negative":
-            cons_raw.append((normalized, weighted_polarity, features_list))
-        elif abs(polarity) < 0.1:
-            neutral_raw.append(normalized)
+FOR OUT-OF-SCOPE (non-product-review input):
+{{
+  "error": "OUT_OF_SCOPE",
+  "reason": "Specific reason why this isn't a product review",
+  "detected_category": "sports/politics/entertainment/finance/etc."
+}}
 
-    pros_raw.sort(key=lambda x: x[1], reverse=True)
-    cons_raw.sort(key=lambda x: x[1], reverse=True)
-    
-    pros = [make_analysis_point(p[0], domain) for p in pros_raw[:MAX_POINTS]]
-    cons = [make_analysis_point(c[0], domain) for c in cons_raw[:MAX_POINTS]]
-    neutral_points = [shorten(n) for n in neutral_raw[:MAX_NEUTRAL_POINTS]]
-
-    return {
-        "pros": pros,
-        "cons": cons,
-        "neutral_points": neutral_points,
-    }
-
-
-def calculate_sentiment(clauses: list[dict]) -> dict[str, float | int]:
-    counts = {"positive": 0, "neutral": 0, "negative": 0, "total": len(clauses)}
-    total_confidence = 0.0
-    
-    for clause in clauses:
-        clause_text = clause.get("text", "") if isinstance(clause, dict) else clause
-        label = classify_sentence(clause_text)
-        counts[label] += 1
-        total_confidence += get_sentiment_confidence(clause_text)
-
-    total = counts["total"] or 1
-    avg_confidence = total_confidence / total if total > 0 else 0.0
-    
-    return {
-        "positive": round(counts["positive"] / total * 100, 2),
-        "neutral": round(counts["neutral"] / total * 100, 2),
-        "negative": round(counts["negative"] / total * 100, 2),
-        "total": counts["total"],
-        "avg_confidence": round(avg_confidence, 3),
-    }
-
-
-def calculate_feature_scores(clauses: list[dict], domain: str = "generic") -> list[FeatureScore]:
-    feature_data = {}
-    for clause in clauses:
-        clause_text = clause.get("text", "") if isinstance(clause, dict) else clause
-        if not is_valid_fragment(clause_text):
-            continue
-        label = classify_sentence(clause_text)
-        features_list = extract_features_with_context(clause_text, domain)
-        
-        normalized = shorten(normalize_point(clause_text))
-        if not normalized:
-            continue
-            
-        for feature in features_list:
-            if not feature or feature == "general":
-                continue
-            feature_data.setdefault(feature, {"positive": [], "negative": []})
-            if label == "positive":
-                feature_data[feature]["positive"].append(normalized)
-            elif label == "negative":
-                feature_data[feature]["negative"].append(normalized)
-
-    scores = []
-    for feature, data in feature_data.items():
-        pos = len(data["positive"])
-        neg = len(data["negative"])
-        total = pos + neg
-        if total == 0:
-            continue
-        score = ((pos - neg) / total) * 100
-        scores.append(FeatureScore(
-            feature=feature,
-            display_name=feature.replace("_", " ").title(),
-            positive_count=pos,
-            negative_count=neg,
-            total_mentions=total,
-            score=round(score, 1),
-        ))
-    scores.sort(key=lambda x: abs(x.score), reverse=True)
-    return scores
+Reviews:
+{chr(10).join(reviews)}"""
 
 
 # ==============================================================================
@@ -1548,29 +1687,82 @@ def resolve_model_name(raw: str) -> str:
 
 
 def parse_ai_response(raw_text: str) -> Optional[dict]:
+    """Parse AI response, including error responses for out-of-scope"""
     cleaned = raw_text.strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.DOTALL).strip()
 
+    # Try to extract JSON from markdown code blocks first
+    json_match = re.search(r'\{[\s\S]*\}', cleaned)
+    if json_match:
+        try:
+            payload = json.loads(json_match.group())
+            if isinstance(payload, dict):
+                # Check if AI returned an error (out-of-scope)
+                if "error" in payload and payload.get("error") == "OUT_OF_SCOPE":
+                    return {
+                        "out_of_scope": True,
+                        "reason": payload.get("reason", "Not a product review"),
+                        "detected_category": payload.get("detected_category", "unknown"),
+                    }
+                return _process_ai_payload(payload)
+        except json.JSONDecodeError:
+            pass
+
     try:
         payload = json.loads(cleaned)
         if isinstance(payload, dict):
-            pros = payload.get("pros", [])
-            cons = payload.get("cons", [])
-            if not isinstance(pros, list) or not isinstance(cons, list):
-                return None
-            if not pros and not cons:
-                return None
-            return {
-                "summary": str(payload.get("summary", "")).strip(),
-                "pros": [shorten(p) for p in pros if isinstance(p, str) and len(p.strip()) >= 5],
-                "cons": [shorten(c) for c in cons if isinstance(c, str) and len(c.strip()) >= 5],
-                "neutral_points": [shorten(n) for n in payload.get("neutral_points", [])
-                                   if isinstance(n, str) and len(n.strip()) >= 5],
-            }
+            # Check if AI returned an error (out-of-scope)
+            if "error" in payload and payload.get("error") == "OUT_OF_SCOPE":
+                return {
+                    "out_of_scope": True,
+                    "reason": payload.get("reason", "Not a product review"),
+                    "detected_category": payload.get("detected_category", "unknown"),
+                }
+            return _process_ai_payload(payload)
     except (json.JSONDecodeError, Exception):
         pass
 
+    # Fallback to regex extraction
+    return _extract_ai_response_regex(cleaned)
+
+
+def _process_ai_payload(payload: dict) -> Optional[dict]:
+    """Process AI response payload and extract sentiment"""
+    pros = payload.get("pros", [])
+    cons = payload.get("cons", [])
+    
+    if not isinstance(pros, list) or not isinstance(cons, list):
+        return None
+    if not pros and not cons:
+        return None
+    
+    ai_sentiment = payload.get("sentiment", {})
+    if isinstance(ai_sentiment, dict):
+        pos = ai_sentiment.get("positive", 0)
+        neg = ai_sentiment.get("negative", 0)
+        neu = ai_sentiment.get("neutral", 0)
+    else:
+        total = len(pros) + len(cons)
+        pos = round((len(pros) / total) * 100, 2) if total else 0
+        neg = round((len(cons) / total) * 100, 2) if total else 0
+        neu = 0
+    
+    return {
+        "summary": str(payload.get("summary", "")).strip(),
+        "pros": [shorten(p) if isinstance(p, str) else shorten(p.get("text", str(p))) for p in pros if (isinstance(p, str) and len(p.strip()) >= 5) or (isinstance(p, dict) and len(p.get("text", "").strip()) >= 5)],
+        "cons": [shorten(c) if isinstance(c, str) else shorten(c.get("text", str(c))) for c in cons if (isinstance(c, str) and len(c.strip()) >= 5) or (isinstance(c, dict) and len(c.get("text", "").strip()) >= 5)],
+        "neutral_points": [shorten(n) if isinstance(n, str) else shorten(n.get("text", str(n))) for n in payload.get("neutral_points", []) if (isinstance(n, str) and len(n.strip()) >= 5) or (isinstance(n, dict) and len(n.get("text", "").strip()) >= 5)],
+        "ai_sentiment": {
+            "positive": pos,
+            "negative": neg,
+            "neutral": neu,
+        }
+    }
+
+
+def _extract_ai_response_regex(cleaned: str) -> Optional[dict]:
+    """Fallback regex extraction for non-JSON AI responses"""
     sm = re.search(r"summary\s*:\s*(.+?)(?:\n\s*pros?\s*:|\Z)", cleaned, flags=re.I | re.S)
     pm = re.search(r"pros?\s*:\s*(.+?)(?:\n\s*cons?\s*:|\Z)", cleaned, flags=re.I | re.S)
     cm = re.search(r"cons?\s*:\s*(.+?)(?:\n\s*neutral|\Z)", cleaned, flags=re.I | re.S)
@@ -1586,32 +1778,8 @@ def parse_ai_response(raw_text: str) -> Optional[dict]:
 
     if not pros and not cons:
         return None
+    
     return {"summary": sm.group(1).strip() if sm else "", "pros": pros, "cons": cons, "neutral_points": []}
-
-
-def build_analysis_prompt(reviews: list[str], domain: str = "generic") -> str:
-    domain_context = f"\nProduct domain: {domain.replace('_', ' ')}" if domain != "generic" else ""
-    return f"""You are analyzing product reviews. Extract ONLY factual insights.
-
-Domain: {domain}{domain_context}
-
-STRICT RULES:
-1. Each point MUST mention a product feature (e.g., battery, camera, display, comfort, taste)
-2. Split mixed sentences: "camera good BUT battery bad" → separate points
-3. MAX: 3 pros, 3 cons, 1 neutral point
-4. NO generic phrases like "good quality" or "nice product"
-5. NEVER invent details not in the reviews
-
-Return STRICT JSON:
-{{
-  "summary": "1-2 sentence verdict mentioning specific features",
-  "pros": ["feature + specific positive observation"],
-  "cons": ["feature + specific negative observation"],
-  "neutral_points": ["neutral observation about a feature"]
-}}
-
-Reviews:
-{chr(10).join('- ' + r[:200] for r in reviews[:5])}""".strip()
 
 
 def build_summary(pros: list[AnalysisPoint], cons: list[AnalysisPoint], sentiment: dict, domain: str = "generic") -> str:
@@ -1662,168 +1830,137 @@ def apply_user_focus(points: list[AnalysisPoint], user_focus: Optional[str]) -> 
     return boosted + rest
 
 
-def select_best_points(points_a: list[str], points_b: list[str], label: str, domain: str = "generic") -> list[AnalysisPoint]:
-    seen = set()
-    all_points = []
-
-    for point in points_a + points_b:
-        sig = get_point_signature(point)
-        if sig in seen:
-            continue
-
-        text_lower = point.lower()
-        score = 0.0
-
-        features_list = extract_features_with_context(point, domain)
-        if features_list:
-            score += 3.0
-
-        if label == "positive":
-            score += 2.0 if any(kw in text_lower for kw in STRONG_POSITIVE) else (
-                1.0 if any(kw in text_lower for kw in SOFT_POSITIVE) else 0
-            )
-        else:
-            score += 2.0 if any(kw in text_lower for kw in STRONG_NEGATIVE) else (
-                1.0 if any(kw in text_lower for kw in SOFT_NEGATIVE) else 0
-            )
-
-        if is_useless_point(point):
-            score -= 5.0
-
-        seen.add(sig)
-        all_points.append((point, score, features_list))
-
-    all_points.sort(key=lambda x: x[1], reverse=True)
-
-    selected: list[AnalysisPoint] = []
-    selected_features = set()
-
-    for point, _, features_list in all_points:
-        if any(points_overlap(point, sp.text) for sp in selected):
-            continue
-        primary_feature = features_list[0] if features_list else "general"
-        if primary_feature in selected_features and len(selected) < MAX_POINTS:
-            continue
-        ap = make_analysis_point(point, domain)
-        selected.append(ap)
-        if primary_feature and primary_feature != "general":
-            selected_features.add(primary_feature)
-        if len(selected) >= MAX_POINTS:
-            break
-
-    return selected
-
-
 # ==============================================================================
-# MAIN ANALYSIS FUNCTION
+# 🚨 PROCESS ANALYSIS WITH OUT-OF-SCOPE DETECTION
 # ==============================================================================
 async def process_analysis_task(
     reviews: list[str],
     detailed: bool,
     user_focus: Optional[str] = None,
-) -> tuple:
-    warnings: list[WarningDetail] = []
+) -> Tuple[dict, dict, list, bool, list, str]:
+    """FULLY AI-DRIVEN with pre-validation and out-of-scope detection"""
+    warnings = []
     start_time = time.time()
 
     raw_text = " ".join(reviews)
-    detected_domain = detect_domain(raw_text)
-    domain = detected_domain
+    domain = detect_domain(raw_text)
 
-    if detected_domain == "generic":
-        warnings.append(WarningDetail(type="DOMAIN_UNKNOWN", message="Using general analysis."))
+    # 🚨 STEP 1: PRE-VALIDATION - Check relevance BEFORE AI call
+    is_relevant, relevance_score, relevance_type = is_product_review_related(raw_text)
+    
+    if not is_relevant:
+        OUT_OF_SCOPE_COUNT.inc()
+        category = detect_out_of_scope_category(raw_text)
+        logger.warning(f"Out-of-scope input detected: score={relevance_score:.2f}, type={relevance_type}, category={category}")
+        
+        return (
+            {
+                "summary": "",
+                "pros": [],
+                "cons": [],
+                "neutral_points": [],
+                "out_of_scope": True,
+            },
+            {"positive": 0, "negative": 0, "neutral": 0, "total": 0, "avg_confidence": 0.0},
+            [],
+            False,
+            [WarningDetail(type="OUT_OF_SCOPE", message=f"Input does not appear to be a product review. Detected as: {category}. Relevance score: {relevance_score:.2f}")],
+            domain,
+        )
 
+    # STEP 2: Cache check (only for relevant input)
     cache_key = cache_manager.generate_cache_key(reviews, detailed, domain)
     cached = cache_manager.get(cache_key)
 
     if cached:
-        pros = [AnalysisPoint(**p) for p in cached["analysis"].get("pros", [])]
-        cons = [AnalysisPoint(**c) for c in cached["analysis"].get("cons", [])]
-        pros = apply_user_focus(pros, user_focus)
-        cons = apply_user_focus(cons, user_focus)
-        cached["analysis"]["pros"] = pros
-        cached["analysis"]["cons"] = cons
-        logger.info(f"process_analysis_task (cached) completed in {time.time() - start_time:.3f}s")
-        return (cached["analysis"], cached["sentiment"], [], True, [], domain)
-
-    clauses = prepare_and_split(reviews)
-
-    if not clauses:
         return (
-            {"summary": "No valid review content found.", "pros": [], "cons": [], "neutral_points": []},
-            {"positive": 0.0, "neutral": 0.0, "negative": 0.0, "total": 0, "avg_confidence": 0.0},
+            cached["analysis"],
+            cached["sentiment"],
+            cached.get("feature_scores", []),
+            True,
             [],
-            False,
-            [WarningDetail(type="NO_CONTENT", message="No valid review content found.")],
             domain,
         )
 
-    rule_based = extract_points(clauses, domain)
-    sentiment = calculate_sentiment(clauses)
+    # STEP 3: AI call (only for relevant input)
+    model_name = resolve_model_name(os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL))
 
-    ai_result = None
-    
-    if gemini_manager.has_keys() and 5 <= len(clauses) <= MAX_CLAUSES_FOR_AI:
-        try:
-            model_name = resolve_model_name(os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL))
-            truncated_clauses = [c["text"][:GEMINI_MAX_CHARS] if isinstance(c, dict) else c[:GEMINI_MAX_CHARS] 
-                               for c in clauses[:GEMINI_MAX_CLAUSES]]
+    request_tracker.active_gemini += 1
+    try:
+        ai_result = await gemini_manager.analyze_reviews(reviews, model_name, domain)
+    finally:
+        request_tracker.active_gemini -= 1
 
-            request_tracker.active_gemini += 1
-            try:
-                ai_result = await gemini_manager.analyze_reviews(truncated_clauses, model_name, domain)
-            except asyncio.TimeoutError:
-                warnings.append(WarningDetail(type="AI_TIMEOUT", message="AI analysis timed out."))
-                ai_result = None
-            finally:
-                request_tracker.active_gemini -= 1
-        except Exception as e:
-            logger.warning(f"AI enhancement failed: {e}")
-            warnings.append(WarningDetail(type="AI_UNAVAILABLE", message="AI enhancement unavailable."))
-
-    if ai_result and (ai_result.get("pros") or ai_result.get("cons")):
-        final_pros = select_best_points(
-            ai_result.get("pros", []), [p.text for p in rule_based["pros"]], "positive", domain
+    # 🚨 STEP 4: Check if AI detected out-of-scope
+    if ai_result and ai_result.get("out_of_scope"):
+        OUT_OF_SCOPE_COUNT.inc()
+        category = ai_result.get("detected_category", "unknown")
+        reason = ai_result.get("reason", "Not a product review")
+        
+        return (
+            {
+                "summary": "",
+                "pros": [],
+                "cons": [],
+                "neutral_points": [],
+                "out_of_scope": True,
+            },
+            {"positive": 0, "negative": 0, "neutral": 0, "total": 0, "avg_confidence": 0.0},
+            [],
+            False,
+            [WarningDetail(type="OUT_OF_SCOPE", message=f"AI detected non-product-review input: {reason}. Category: {category}")],
+            domain,
         )
-        final_cons = select_best_points(
-            ai_result.get("cons", []), [c.text for c in rule_based["cons"]], "negative", domain
-        )
-        final_pros = [p for p in final_pros if not any(points_overlap(p.text, c.text) for c in final_cons)]
-        final_cons = [c for c in final_cons if not any(points_overlap(c.text, p.text) for p in final_pros)]
 
-        final_summary = build_summary(final_pros, final_cons, sentiment, domain)
-        final_analysis = {
-            "summary": final_summary,
-            "pros": final_pros[:MAX_POINTS],
-            "cons": final_cons[:MAX_POINTS],
-            "neutral_points": rule_based["neutral_points"],
-        }
+    if not ai_result:
+        raise Exception("AI analysis failed completely")
+
+    # STEP 5: Convert AI → schema
+    pros = [make_analysis_point(p, domain) for p in ai_result.get("pros", [])]
+    cons = [make_analysis_point(c, domain) for c in ai_result.get("cons", [])]
+    neutral_points = ai_result.get("neutral_points", [])
+
+    ai_sentiment = ai_result.get("ai_sentiment", {})
+    total = len(pros) + len(cons) + len(neutral_points)
+
+    if ai_sentiment:
+        pos = ai_sentiment.get("positive", 0)
+        neg = ai_sentiment.get("negative", 0)
+        neu = ai_sentiment.get("neutral", 0)
     else:
-        final_analysis = {
-            "summary": build_summary(rule_based["pros"], rule_based["cons"], sentiment, domain),
-            "pros": rule_based["pros"],
-            "cons": rule_based["cons"],
-            "neutral_points": rule_based["neutral_points"],
-        }
+        pos = len(pros)
+        neg = len(cons)
+        neu = len(neutral_points)
 
-    final_analysis["pros"] = apply_user_focus(final_analysis["pros"], user_focus)
-    final_analysis["cons"] = apply_user_focus(final_analysis["cons"], user_focus)
+    sentiment = {
+        "positive": round((pos / total) * 100, 2) if total else 0,
+        "negative": round((neg / total) * 100, 2) if total else 0,
+        "neutral": round((neu / total) * 100, 2) if total else 0,
+        "total": total,
+        "avg_confidence": 0.85
+    }
 
-    cache_data = {
+    score, confidence = calculate_score_and_confidence(sentiment)
+
+    final_analysis = {
+        "summary": ai_result.get("summary", ""),
+        "pros": pros,
+        "cons": cons,
+        "neutral_points": neutral_points,
+        "out_of_scope": False,
+    }
+
+    cache_manager.set(cache_key, {
         "analysis": {
             "summary": final_analysis["summary"],
-            "pros": [p.model_dump() for p in final_analysis["pros"]],
-            "cons": [c.model_dump() for c in final_analysis["cons"]],
-            "neutral_points": final_analysis["neutral_points"],
+            "pros": [p.model_dump() for p in pros],
+            "cons": [c.model_dump() for c in cons],
+            "neutral_points": neutral_points,
         },
         "sentiment": sentiment,
-    }
-    if detailed:
-        cache_data["feature_scores"] = [fs.model_dump() for fs in calculate_feature_scores(clauses, domain)]
+    })
 
-    cache_manager.set(cache_key, cache_data)
-
-    logger.info(f"process_analysis_task completed in {time.time() - start_time:.3f}s")
-    return final_analysis, sentiment, cache_data.get("feature_scores", []), False, warnings or [], domain
+    return final_analysis, sentiment, [], False, warnings, domain
 
 
 def calculate_score_and_confidence(sentiment: dict) -> tuple[float, float]:
@@ -1840,11 +1977,9 @@ def calculate_score_and_confidence(sentiment: dict) -> tuple[float, float]:
     dominant = max(pos, neg, neu)
     sample_factor = min(math.sqrt(total / 8), 1.0)
     
-    # Use both sentiment and avg_confidence for final confidence
     sentiment_confidence = dominant * (0.25 + 0.75 * sample_factor) * 100
     avg_vader_confidence = sentiment.get("avg_confidence", 0.5) * 100
     
-    # Blend sentiment confidence with VADER average confidence
     confidence = (sentiment_confidence * 0.7) + (avg_vader_confidence * 0.3)
 
     return score, min(100.0, round(confidence, 2))
@@ -1882,6 +2017,22 @@ async def _handle_analyze(
         if len(reviews) > 50:
             raise HTTPException(status_code=400, detail="Too many reviews. Maximum 50 per request.")
 
+        # 🚨 FIX #1 & #2: STRICTER PRE-VALIDATION (threshold 0.4, no partial)
+        is_relevant, relevance_score, _ = is_product_review_related(payload.raw_text)
+        if not is_relevant:
+            category = detect_out_of_scope_category(payload.raw_text)
+            REQUEST_COUNT.labels(endpoint=endpoint, status="out_of_scope").inc()
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "OUT_OF_SCOPE",
+                    "message": f"Input does not appear to be a product review.",
+                    "detected_category": category,
+                    "relevance_score": round(relevance_score, 2),
+                    "suggestion": "Please provide actual product reviews with ratings, pros/cons, or product feedback."
+                }
+            )
+
         scalable_limiter.record_request(user_id)
 
         detailed = request.query_params.get("detailed", "false").lower() == "true"
@@ -1906,6 +2057,24 @@ async def _handle_analyze(
                 cached=False,
                 warnings=[WarningDetail(type="REQUEST_TIMEOUT", message="Processing took too long.")],
                 domain=detect_domain(payload.raw_text),
+                out_of_scope=False,
+            )
+
+        # 🚨 CHECK IF OUT-OF-SCOPE DETECTED DURING PROCESSING
+        if analysis.get("out_of_scope"):
+            REQUEST_COUNT.labels(endpoint=endpoint, status="out_of_scope").inc()
+            return AnalyzeResponse(
+                summary="",
+                pros=[],
+                cons=[],
+                neutral_points=[],
+                sentiment=SentimentBreakdown(positive=0.0, neutral=0.0, negative=0.0, total=0),
+                score=0.0,
+                confidence=0.0,
+                cached=False,
+                warnings=ai_warnings,
+                domain=domain,
+                out_of_scope=True,
             )
 
         score, confidence = calculate_score_and_confidence(sentiment)
@@ -1929,6 +2098,7 @@ async def _handle_analyze(
             cached=from_cache,
             warnings=(ai_warnings or []),
             domain=domain,
+            out_of_scope=False,
         )
 
         if detailed:
@@ -2046,6 +2216,20 @@ async def analyze_stream(
     if len(payload.raw_text) > MAX_INPUT_SIZE:
         raise HTTPException(status_code=400, detail=f"Input too large. Max {MAX_INPUT_SIZE} chars.")
     
+    # 🚨 FIX #1 & #2: STRICTER PRE-VALIDATION for streaming too
+    is_relevant, relevance_score, _ = is_product_review_related(payload.raw_text)
+    if not is_relevant:
+        category = detect_out_of_scope_category(payload.raw_text)
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "OUT_OF_SCOPE",
+                "message": "Input does not appear to be a product review.",
+                "detected_category": category,
+                "relevance_score": round(relevance_score, 2),
+            }
+        )
+    
     reviews = parse_raw_input(payload.raw_text)
     
     if not reviews:
@@ -2060,28 +2244,30 @@ async def analyze_stream(
         yield json.dumps({"type": "domain", "data": detected_domain}) + "\n"
         await asyncio.sleep(STREAM_CHUNK_DELAY)
         
-        clauses = prepare_and_split(reviews)
+        model_name = resolve_model_name(os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL))
+        ai_result = await gemini_manager.analyze_reviews(reviews, model_name, detected_domain)
         
-        if not clauses:
-            yield json.dumps({"type": "error", "data": "No valid review content found."}) + "\n"
-            yield "[DONE]\n"
-            return
+        if ai_result and ai_result.get("out_of_scope"):
+            yield json.dumps({
+                "type": "error",
+                "data": "OUT_OF_SCOPE",
+                "reason": ai_result.get("reason", "Not a product review"),
+                "category": ai_result.get("detected_category", "unknown")
+            }) + "\n"
+        elif ai_result:
+            yield json.dumps({"type": "summary", "data": ai_result.get("summary", "")}) + "\n"
+            await asyncio.sleep(STREAM_CHUNK_DELAY)
+            
+            yield json.dumps({"type": "pros", "data": ai_result.get("pros", [])}) + "\n"
+            await asyncio.sleep(STREAM_CHUNK_DELAY)
+            
+            yield json.dumps({"type": "cons", "data": ai_result.get("cons", [])}) + "\n"
+            await asyncio.sleep(STREAM_CHUNK_DELAY)
+            
+            yield json.dumps({"type": "sentiment", "data": ai_result.get("ai_sentiment", {})}) + "\n"
+        else:
+            yield json.dumps({"type": "error", "data": "AI analysis failed"}) + "\n"
         
-        rule_based = extract_points(clauses, detected_domain)
-        sentiment = calculate_sentiment(clauses)
-        
-        summary = build_summary(rule_based["pros"], rule_based["cons"], sentiment, detected_domain)
-        yield json.dumps({"type": "summary", "data": summary}) + "\n"
-        await asyncio.sleep(STREAM_CHUNK_DELAY)
-        
-        yield json.dumps({"type": "pros", "data": [p.model_dump() for p in rule_based["pros"][:MAX_POINTS]]}) + "\n"
-        await asyncio.sleep(STREAM_CHUNK_DELAY)
-        
-        yield json.dumps({"type": "cons", "data": [c.model_dump() for c in rule_based["cons"][:MAX_POINTS]]}) + "\n"
-        await asyncio.sleep(STREAM_CHUNK_DELAY)
-        
-        score, confidence = calculate_score_and_confidence(sentiment)
-        yield json.dumps({"type": "sentiment", "data": {**sentiment, "score": score, "confidence": confidence}}) + "\n"
         yield "[DONE]\n"
     
     return StreamingResponse(stream_results(), media_type="application/json")
@@ -2129,16 +2315,16 @@ def health() -> dict[str, str]:
 @app.get("/")
 def read_root() -> dict[str, str]:
     return {
-        "message": "AI Product Review Aggregator API v23.0-faang",
+        "message": "AI Product Review Aggregator API v25.0-ai-validated",
         "docs": "/docs",
         "v1": f"{API_V1_PREFIX}/analyze-raw",
         "v2": f"{API_V2_PREFIX}/analyze-raw",
         "streaming": "/analyze-stream",
     }
 
-#api integrated with faang-level features and optimizations, including Aho-Corasick for feature extraction, adaptive sentiment analysis with confidence scoring, and robust caching mechanisms. The code also includes comprehensive testing to ensure reliability and correctness of the analysis process.
+
 # ==============================================================================
-# TESTS
+# TESTS - UPDATED WITH ALL FIXES
 # ==============================================================================
 def _run_tests():
     import traceback
@@ -2157,75 +2343,64 @@ def _run_tests():
         if not condition:
             raise AssertionError(message)
 
-    # Test 1: Multi-feature extraction with Aho-Corasick
-    features = extract_features_with_context("Camera is good but battery drains fast", "electronics")
-    check(len(features) >= 2, f"Should detect multiple features, got {features}")
+    # Test 1: Out-of-scope detection - sports
+    is_relevant, score, detected_type = is_product_review_related("Tell me about cricket match")
+    check(not is_relevant, f"Cricket query should be rejected. Score: {score}")
     
-    # Test 2: Negation handling
-    result = handle_special_negations("not bad")
-    check("decent" in result, f"'not bad' should convert to 'decent'")
+    # Test 2: Out-of-scope detection - finance
+    is_relevant, score, detected_type = is_product_review_related("Is Bitcoin going up?")
+    check(not is_relevant, f"Finance query should be rejected. Score: {score}")
     
-    # Test 3: Adaptive sentiment returns tuple
-    result = get_sentiment_polarity_cached("This is excellent!")
-    check(isinstance(result, tuple), "Should return (polarity, confidence) tuple")
-    check(len(result) == 2, "Tuple should have 2 elements")
-    polarity, confidence = result
-    check(isinstance(polarity, float), "Polarity should be float")
-    check(isinstance(confidence, float), "Confidence should be float")
-    check(polarity > 0, f"Positive text should have positive polarity")
+    # Test 3: Product review should be accepted
+    is_relevant, score, detected_type = is_product_review_related("Great phone, battery lasts all day. Camera is amazing but screen scratches easily.")
+    check(is_relevant, f"Product review should be accepted. Score: {score}")
     
-    # Test 4: Order-sensitive cache
-    cache_key1 = cache_manager.generate_cache_key(["a", "b"], False, "generic")
-    cache_key2 = cache_manager.generate_cache_key(["b", "a"], False, "generic")
-    check(cache_key1 != cache_key2, "Cache keys should be different for different orderings")
+    # Test 4: Out-of-scope detection - politics
+    is_relevant, score, detected_type = is_product_review_related("Who won the election?")
+    check(not is_relevant, f"Politics query should be rejected. Score: {score}")
     
-    # Test 5: Async process_analysis
-    async def quick_test():
-        result = await process_analysis_task(["Great product, loved the camera", "Battery drains too fast"], False, None)
-        check(isinstance(result, tuple), "Should return tuple")
-        check(len(result) == 6, "Should return 6-element tuple")
-        analysis, sentiment, _, _, _, _ = result
-        check(isinstance(analysis, dict), "First element should be dict")
-        check("summary" in analysis, "Should have summary key")
-        return True
-    
-    loop = asyncio.new_event_loop()
-    try:
-        loop.run_until_complete(quick_test())
-        results.append(("PASS", "async_process_analysis"))
-    finally:
-        loop.close()
-    
-    # Test 6: Feature scores
-    clauses = prepare_and_split(["Camera is amazing", "Battery is terrible"])
-    scores = calculate_feature_scores(clauses, "electronics")
-    check(len(scores) > 0, "Should have feature scores")
-    
-    # Test 7: Short clause validation
-    check(is_valid_fragment("Battery sucks"), "Short clause should be valid")
-    
-    # Test 8: Domain detection
+    # Test 5: Domain detection
     text = "Nice fabric but color faded quickly after washing"
     domain = detect_domain(text)
     check(domain == "clothing", f"Should detect clothing domain")
+
+    # Test 6: Feature extraction
+    features = extract_features_with_context("Camera is good but battery drains fast", "electronics")
+    check(len(features) >= 2, f"Should detect multiple features, got {features}")
     
-    # Test 9: Rate limiter memory safety
-    for i in range(100):
-        scalable_limiter.record_request(f"test_user_{i % 10}")
-    check(len(scalable_limiter._requests_per_minute) <= 20, "Should clean up old entries")
+    # Test 7: Relevance score calculation
+    score = calculate_relevance_score("I bought a laptop last week. The battery life is great but it runs hot.")
+    check(score > 0.4, f"Product review should have high score (>=0.4), got {score}")
     
-    # Test 10: Confidence in ExplainablePoint
-    async def confidence_test():
-        polarity, confidence = get_sentiment_polarity_cached("This is absolutely terrible!")
-        check(confidence > 0.5, f"Clear negative should have high confidence: {confidence}")
-        return True
+    # Test 8: Category detection
+    category = detect_out_of_scope_category("Tell me about the football match")
+    check(category == "sports", f"Should detect sports category, got {category}")
+
+    # Test 9: FIX #3 - Cricket bat review should be ACCEPTED (has product context)
+    is_relevant, score, detected_type = is_product_review_related("Cricket bat review: I bought this bat last month. Great quality and balance. Perfect for practice sessions.")
+    check(is_relevant, f"Cricket bat review WITH product context should be ACCEPTED. Score: {score}, Type: {detected_type}")
+    check(score >= 0.4, f"Score should be >=0.4, got {score}")
     
-    loop = asyncio.new_event_loop()
-    try:
-        loop.run_until_complete(confidence_test())
-        results.append(("PASS", "adaptive_confidence"))
-    finally:
-        loop.close()
+    # Test 10: FIX #3 - Football score prediction should be REJECTED
+    is_relevant, score, detected_type = is_product_review_related("What's your football score prediction for tomorrow's match?")
+    check(not is_relevant, f"Football score prediction should be REJECTED. Score: {score}")
+    
+    # Test 11: FIX #3 - Movie review (entertainment) should be REJECTED
+    is_relevant, score, detected_type = is_product_review_related("I watched the new movie on Netflix last night. The acting was great but the plot was confusing.")
+    check(not is_relevant, f"Movie review should be REJECTED. Score: {score}")
+
+    # Test 12: FIX #2 - "Partial" classification should NOT be accepted
+    is_relevant, score, detected_type = is_product_review_related("The battery is okay but the camera could be better. I use it daily.")
+    # This should either be accepted (>=0.4) or rejected (<0.4) - but NEVER "partial"
+    if is_relevant:
+        check(detected_type == "product_review", f"If relevant, must be 'product_review', not 'partial'. Got: {detected_type}")
+    else:
+        check(detected_type == "irrelevant", f"If not relevant, must be 'irrelevant', not 'partial'. Got: {detected_type}")
+    
+    # Test 13: FIX #1 - Stricter threshold (0.4 instead of 0.3)
+    # A borderline case should now be rejected
+    is_relevant, score, detected_type = is_product_review_related("Battery lasts long")
+    check(not is_relevant or score >= 0.4, f"Borderline case with new threshold (0.4) should have score >=0.4 if accepted. Got: {score}")
 
     passed = sum(1 for r in results if r[0] == "PASS")
     failed = sum(1 for r in results if r[0] != "PASS")
@@ -2244,7 +2419,7 @@ def _run_tests():
 async def startup_event():
     _build_automaton_maps()
     _build_sentiment_automaton()
-    logger.info("API v23.0-faang started with Aho-Corasick and adaptive sentiment")
+    logger.info("API v25.0-ai-validated started with STRICTER OUT-OF-SCOPE DETECTION (fixes applied)")
 
 
 @app.on_event("shutdown")

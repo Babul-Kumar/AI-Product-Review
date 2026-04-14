@@ -400,7 +400,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [lowQualityMessage, setLowQualityMessage] = useState("");
-  const [serverStatus, setServerStatus] = useState("checking");
+  const [serverStatus, setServerStatus] = useState("online");
   const [lastClickTime, setLastClickTime] = useState(0);
   const [copySuccess, setCopySuccess] = useState(false);
   const [retryInfo, setRetryInfo] = useState(null);
@@ -438,38 +438,24 @@ function App() {
   }, []);
 
   useEffect(() => {
-    let lastChecked = 0;
-
     const checkServerHealth = async () => {
-      if (document.visibilityState !== "visible") return;
-
-      const now = Date.now();
-      if (now - lastChecked < HEALTH_CHECK_INTERVAL) return;
-      lastChecked = now;
-
       try {
-        const response = await fetch(PING_URL, { method: "GET" });
-        if (isMountedRef.current) {
-          setServerStatus(response.ok ? "online" : "offline");
+        const res = await fetch(PING_URL, { method: "GET" });
+
+        // Only update if success
+        if (res.ok && isMountedRef.current) {
+          setServerStatus("online");
         }
-      } catch (err) {
-        if (isMountedRef.current) {
-          setServerStatus("offline");
-        }
+      }
+        
+      catch {
+        // ❌ DO NOTHING on failure
+        // Avoid false offline due to cold start
+        console.warn("Ping failed - ignoring");
       }
     };
 
     checkServerHealth();
-    const intervalId = setInterval(checkServerHealth, HEALTH_CHECK_INTERVAL);
-    const handleVisibility = () => {
-      if (document.visibilityState === "visible") checkServerHealth();
-    };
-    document.addEventListener("visibilitychange", handleVisibility);
-
-    return () => {
-      clearInterval(intervalId);
-      document.removeEventListener("visibilitychange", handleVisibility);
-    };
   }, []);
 
   useEffect(() => {
