@@ -785,101 +785,102 @@ function App() {
     // ✅ FIX 5: DON'T set streaming false here - let fallback finish naturally
     // REMOVED: setIsStreaming(false);
     
-    const { response, retriesUsed } = await fetchWithRetry(
-      ANALYZE_URL, fetchOptions, MAX_RETRIES, 0, newRequestId
-    );
+    try {
+      const { response, retriesUsed } = await fetchWithRetry(
+        ANALYZE_URL, fetchOptions, MAX_RETRIES, 0, newRequestId
+      );
 
-    setRetryInfo((prev) => prev ? { ...prev, retries: retriesUsed, status: retriesUsed > 0 ? "retried" : "success" } : null);
+      setRetryInfo((prev) => prev ? { ...prev, retries: retriesUsed, status: retriesUsed > 0 ? "retried" : "success" } : null);
 
-    if (controller.signal.aborted) {
-      setError("Request was cancelled. Please try again.");
-      setLoading(false);
-      inFlightRef.current = false;
+      if (controller.signal.aborted) {
+        setError("Request was cancelled. Please try again.");
+        setLoading(false);
+        inFlightRef.current = false;
+        console.timeEnd(analysisTimerLabel);
+        return;
+      }
+
+      const responseText = await response.text();
+      let data = null;
+
+      if (responseText) {
+        try {
+          data = JSON.parse(responseText);
+        } catch {
+          throw new Error("The server returned invalid JSON.");
+        }
+      }
+
+      if (!response.ok) {
+        const { message, errorCode } = extractMessage(data);
+        let userMessage = message;
+        let errorType = "generic";
+
+        if (response.status === 422) {
+          userMessage = "⚠️ Invalid input format. Please try different text.";
+          errorType = "validation";
+        }
+        else if (errorCode === "INVALID_API_KEY") {
+          userMessage = "🔑 Backend API keys not configured. Please try again later.";
+          errorType = "config";
+        }
+        else if (errorCode === "OUT_OF_SCOPE") {
+          userMessage = "❌ Input is not a valid product review. Please provide text to analyze.";
+          errorType = "validation";
+        }
+        else if (errorCode === "AI_PROCESSING_FAILED" || errorCode === "GEMINI_ERROR") {
+          userMessage = "🤖 AI processing failed. Server may be busy — please try again.";
+          errorType = "ai";
+        }
+        else if (errorCode === "QUEUE_FULL" || errorCode === "RATE_LIMITED") {
+          userMessage = "⚠️ Server queue is full. Please wait and try again.";
+          errorType = "queue";
+        }
+        else if (response.status === 429) {
+          userMessage = "⚠️ API rate limit reached. Please wait a few seconds.";
+          errorType = "rate_limit";
+        }
+        else if (response.status >= 500) {
+          userMessage = "🛠️ Server error. The team has been notified.";
+          errorType = "server";
+        }
+
+        log.error(`[Error:${errorType}] ${message} (code: ${errorCode})`);
+        throw new Error(userMessage);
+      }
+
+      if (!data || typeof data !== "object") {
+        throw new Error("The server returned an empty response.");
+      }
+
+      const normalizedData = normalizeResult(data);
+      
+      lastRequestKeyRef.current = requestKey;
+      lastResultRef.current = normalizedData;
+      lastCacheTimeRef.current = Date.now();
+
+      const endTime = Date.now();
+      const duration = endTime - startTime;
       console.timeEnd(analysisTimerLabel);
-      return;
-    }
+      
+      const stats = {
+        duration,
+        retriesUsed,
+        reviewsAnalyzed: rawReviews.length,
+        responseSize: responseText.length,
+        cached: false,
+        streaming: false,
+      };
+      
+      setAnalysisStats(stats);
+      log.info(`[Analytics] ✅ Analysis completed:`, stats);
 
-    const responseText = await response.text();
-    let data = null;
-
-    if (responseText) {
-      try {
-        data = JSON.parse(responseText);
-      } catch {
-        throw new Error("The server returned invalid JSON.");
+      if (hasMeaningfulInsights(normalizedData)) {
+        setResult(normalizedData);
+      } else {
+        setError("The analysis didn't return meaningful results. Try with different text.");
       }
-    }
-
-    if (!response.ok) {
-      const { message, errorCode } = extractMessage(data);
-      let userMessage = message;
-      let errorType = "generic";
-
-      if (response.status === 422) {
-        userMessage = "⚠️ Invalid input format. Please try different text.";
-        errorType = "validation";
-      }
-      else if (errorCode === "INVALID_API_KEY") {
-        userMessage = "🔑 Backend API keys not configured. Please try again later.";
-        errorType = "config";
-      }
-      else if (errorCode === "OUT_OF_SCOPE") {
-        userMessage = "❌ Input is not a valid product review. Please provide text to analyze.";
-        errorType = "validation";
-      }
-      else if (errorCode === "AI_PROCESSING_FAILED" || errorCode === "GEMINI_ERROR") {
-        userMessage = "🤖 AI processing failed. Server may be busy — please try again.";
-        errorType = "ai";
-      }
-      else if (errorCode === "QUEUE_FULL" || errorCode === "RATE_LIMITED") {
-        userMessage = "⚠️ Server queue is full. Please wait and try again.";
-        errorType = "queue";
-      }
-      else if (response.status === 429) {
-        userMessage = "⚠️ API rate limit reached. Please wait a few seconds.";
-        errorType = "rate_limit";
-      }
-      else if (response.status >= 500) {
-        userMessage = "🛠️ Server error. The team has been notified.";
-        errorType = "server";
-      }
-
-      log.error(`[Error:${errorType}] ${message} (code: ${errorCode})`);
-      throw new Error(userMessage);
-    }
-
-    if (!data || typeof data !== "object") {
-      throw new Error("The server returned an empty response.");
-    }
-
-    const normalizedData = normalizeResult(data);
-    
-    lastRequestKeyRef.current = requestKey;
-    lastResultRef.current = normalizedData;
-    lastCacheTimeRef.current = Date.now();
-
-    const endTime = Date.now();
-    const duration = endTime - startTime;
-    console.timeEnd(analysisTimerLabel);
-    
-    const stats = {
-      duration,
-      retriesUsed,
-      reviewsAnalyzed: rawReviews.length,
-      responseSize: responseText.length,
-      cached: false,
-      streaming: false,
-    };
-    
-    setAnalysisStats(stats);
-    log.info(`[Analytics] ✅ Analysis completed:`, stats);
-
-    if (hasMeaningfulInsights(normalizedData)) {
-      setResult(normalizedData);
-    } else {
-      setError("The analysis didn't return meaningful results. Try with different text.");
-    }
-    setRetryInfo(null);
+      setRetryInfo(null);
 
     } catch (requestError) {
       if (controller.signal.aborted || requestError.isAbort) {

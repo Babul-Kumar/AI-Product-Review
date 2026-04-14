@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # OPTIONAL DEPENDENCIES
 # ==============================================================================
 try:
-    import orjson
+    import orjson  # pyright: ignore[reportMissingImports]
     USE_ORJSON = True
 except ImportError:
     USE_ORJSON = False
@@ -54,7 +54,7 @@ except ImportError:
     USE_HTTPX = False
 
 try:
-    import ahocorasick
+    import ahocorasick  # pyright: ignore[reportMissingImports]
     USE_AHOCORASICK = True
 except ImportError:
     USE_AHOCORASICK = False
@@ -1033,7 +1033,7 @@ async def verify_api_key(x_api_key: Optional[str] = Header(None)) -> str:
 # PROMETHEUS METRICS
 # ==============================================================================
 try:
-    from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+    from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST  # pyright: ignore[reportMissingImports]
     REQUEST_COUNT = Counter("review_api_requests_total", "Total requests", ["endpoint", "status"])
     REQUEST_LATENCY = Histogram("review_api_request_duration_seconds", "Request latency", ["endpoint"])
     CACHE_HITS = Counter("review_api_cache_hits_total", "Cache hits")
